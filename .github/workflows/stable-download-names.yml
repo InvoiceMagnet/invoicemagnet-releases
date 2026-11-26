@@ -1,0 +1,96 @@
+# Adds copies of the installers under fixed names to every published release,
+# so the website can link to
+#
+#   https://github.com/InvoiceMagnet/invoicemagnet-releases/releases/latest/download/InvoiceMagnet-Windows-x64.exe
+#
+# and always get the newest version. ("latest" skips drafts and pre-releases.)
+#
+# The versioned files stay untouched: the auto-updater (latest.yml,
+# latest-mac.yml, *.blockmap) refers to them by their versioned names.
+#
+# Run it by hand (Actions → "Stable download names" → Run workflow) to add the
+# copies to an existing release, e.g. the current latest one.
+
+name: Stable download names
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag, e.g. v0.1.0-rc.57'
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: stable-download-names-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  stable-names:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      - name: Wait until the installers are uploaded
+        # A release can be published before its assets have finished
+        # uploading, so poll for up to 30 minutes.
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 60); do
+            names="$(gh api "repos/$GH_REPO/releases/tags/$TAG" \
+              --jq '.assets[] | select(.state == "uploaded") | .name')"
+            if grep -Eq -- '^invoicemagnet-.+-x64-setup\.exe$' <<<"$names" \
+              && grep -Eq -- '^invoicemagnet-.+-arm64-setup\.exe$' <<<"$names" \
+              && grep -Eq -- '^invoicemagnet-.+\.dmg$' <<<"$names"; then
+              echo "All installers present."
+              exit 0
+            fi
+            echo "Waiting for installers ($attempt/60)…"
+            sleep 30
+          done
+          echo "::error::Release $TAG is missing installers after 30 minutes:"
+          echo "$names"
+          exit 1
+
+      - name: Upload copies under stable names
+        run: |
+          set -euo pipefail
+          mkdir -p work && cd work
+          names="$(gh api "repos/$GH_REPO/releases/tags/$TAG" --jq '.assets[].name')"
+
+          # versioned-name pattern (regex)          stable name
+          while read -r pattern stable; do
+            matches="$(grep -E -- "$pattern" <<<"$names" || true)"
+            if [ "$(grep -c . <<<"$matches")" -ne 1 ]; then
+              echo "::error::Expected exactly one asset matching $pattern in $TAG, found:"
+              echo "${matches:-none}"
+              exit 1
+            fi
+            echo "$matches → $stable"
+            gh release download "$TAG" --pattern "$matches" --dir . --clobber
+            mv -- "$matches" "$stable"
+            gh release upload "$TAG" "$stable" --clobber
+            rm -- "$stable"
+          done <<'EOF'
+          ^invoicemagnet-.+-x64-setup\.exe$     InvoiceMagnet-Windows-x64.exe
+          ^invoicemagnet-.+-arm64-setup\.exe$   InvoiceMagnet-Windows-ARM64.exe
+          ^invoicemagnet-.+\.dmg$               InvoiceMagnet-macOS.dmg
+          EOF
+
+      - name: Summary
+        run: |
+          base="https://github.com/$GH_REPO/releases/latest/download"
+          {
+            echo "### Stable download links ($TAG)"
+            echo ""
+            echo "- $base/InvoiceMagnet-Windows-x64.exe"
+            echo "- $base/InvoiceMagnet-Windows-ARM64.exe"
+            echo "- $base/InvoiceMagnet-macOS.dmg"
+          } >> "$GITHUB_STEP_SUMMARY"
